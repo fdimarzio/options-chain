@@ -1,8 +1,12 @@
 // src/OptionsChain.jsx
-// Standalone options chain viewer
+// Standalone options chain viewer with inline chart panel + contract calculator
 // Route: /chain (add to main.jsx) or use as separate app
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const PROXY = "https://options-tracker-five.vercel.app/api/schwab-proxy";
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 const T = {
@@ -31,13 +35,15 @@ const css = `
   ::-webkit-scrollbar-thumb { background: ${T.border2}; border-radius: 3px; }
   input { font-family: ${T.font}; }
   @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
-  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
   @keyframes spin { to { transform: rotate(360deg); } }
   .fade-in { animation: fadeIn 0.2s ease forwards; }
   .expiry-row { transition: background 0.12s; cursor: pointer; }
   .expiry-row:hover { background: #151e2a !important; }
-  .strike-row { transition: background 0.08s; }
+  .strike-row { transition: background 0.08s; cursor: default; }
   .strike-row:hover { background: #0f1620 !important; }
+  .chart-btn { opacity: 0.3; transition: opacity 0.15s; background: none; border: none; cursor: pointer; padding: 2px 5px; font-size: 12px; line-height:1; }
+  .strike-row:hover .chart-btn { opacity: 0.8; }
+  .chart-btn.active { opacity: 1 !important; filter: sepia(1) saturate(3) hue-rotate(10deg); }
   @media (max-width: 600px) {
     .chain-table th, .chain-table td { padding: 5px 6px !important; font-size: 10px !important; }
     .hide-mobile { display: none !important; }
@@ -46,51 +52,328 @@ const css = `
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const fmt  = (v, d=2) => v != null ? (+v).toFixed(d) : "—";
-const fmtK = v => v != null ? (+v >= 1000 ? (v/1000).toFixed(0)+"k" : String(v)) : "—";
-const pct  = v => v != null ? (v*100).toFixed(1)+"%" : "—";
-const clr  = (v, pos=T.green, neg=T.red) => !v ? T.muted : +v >= 0 ? pos : neg;
+const fmtK = v => v != null ? (+v >= 1000 ? (v/1000).toFixed(0)+"k" : String(+v)) : "—";
 
-function Spinner() {
-  return <div style={{width:18,height:18,border:`2px solid ${T.border2}`,borderTopColor:T.blue,borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block"}}/>;
+function Spinner({ size=18 }) {
+  return <div style={{width:size,height:size,border:`2px solid ${T.border2}`,borderTopColor:T.blue,borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block",flexShrink:0}}/>;
+}
+
+// ── OI Tracking — register ticker in Supabase col_prefs ──────────────────────
+async function ensureOITracking(ticker) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/col_prefs?select=cols&id=eq.oi_tracked_tickers`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    });
+    const existing = (await res.json())?.[0]?.cols?.tickers || [];
+    if (existing.includes(ticker)) return;
+    const updated = [...new Set([...existing, ticker])];
+    await fetch(`${SUPABASE_URL}/rest/v1/col_prefs`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify({ id: "oi_tracked_tickers", cols: { tickers: updated }, updated_at: new Date().toISOString() }),
+    });
+    console.log(`[OI] Now tracking ${ticker}`);
+  } catch (e) {
+    console.warn("[OI] tracking update failed:", e.message);
+  }
+}
+
+// ── Chart Panel (inline, renders as a <tr>) ───────────────────────────────────
+function ChartPanel({ opt, type, ticker, expiry, stockPrice, onClose, initialPeriod, fullPage }) {
+  const chartRef  = useRef(null);
+  const volRef    = useRef(null);
+  const chartInst = useRef(null);
+  const volInst   = useRef(null);
+  const [loading,   setLoading]   = useState(true);
+  const [error,     setError]     = useState(null);
+  const [contracts, setContracts] = useState(1);
+  const [period,    setPeriod]    = useState(initialPeriod || "day");
+  const [lwcReady,  setLwcReady]  = useState(!!window.LightweightCharts);
+
+  // Derived calc values
+  const mid       = opt.bid != null && opt.ask != null ? (+opt.bid + +opt.ask) / 2 : null;
+  const premium   = mid ?? opt.last ?? opt.mark ?? 0;
+  const cost      = +(premium * contracts * 100).toFixed(2);
+  const breakeven = type === "Call"
+    ? +(+opt.strikePrice + premium).toFixed(2)
+    : +(+opt.strikePrice - premium).toFixed(2);
+  const maxProfit = type === "Call" ? "Unlimited"
+    : `$${(+((opt.strikePrice - premium) * contracts * 100)).toLocaleString()}`;
+  const itm = type === "Call" ? stockPrice > opt.strikePrice : stockPrice < opt.strikePrice;
+
+  // Build OSI option symbol for Schwab price history
+  // e.g. "AAPL  260524C00185000"
+  function buildOSI() {
+    const exp = expiry.replace(/-/g, "").slice(2); // YYMMDD
+    const cp  = type === "Call" ? "C" : "P";
+    const strikePad = (opt.strikePrice * 1000).toFixed(0).padStart(8, "0");
+    return `${ticker.padEnd(6)}${exp}${cp}${strikePad}`;
+  }
+
+  // Load Lightweight Charts if needed
+  useEffect(() => {
+    if (window.LightweightCharts) { setLwcReady(true); return; }
+    const s = document.createElement("script");
+    s.src = "https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js";
+    s.onload  = () => setLwcReady(true);
+    s.onerror = () => setError("Chart library failed to load");
+    document.head.appendChild(s);
+  }, []);
+
+  // Fetch + render chart whenever ready or period changes
+  useEffect(() => {
+    if (!lwcReady || !chartRef.current || !volRef.current) return;
+
+    if (chartInst.current) { try { chartInst.current.remove(); } catch(e){} chartInst.current = null; }
+    if (volInst.current)   { try { volInst.current.remove();   } catch(e){} volInst.current   = null; }
+
+    setLoading(true);
+    setError(null);
+
+    const sym        = buildOSI();
+    const periodVal  = period === "day" ? 1 : 5;
+    const freq       = period === "day" ? 1 : 5;
+    const url = `${PROXY}?path=/marketdata/v1/pricehistory&symbol=${encodeURIComponent(sym)}&periodType=day&period=${periodVal}&frequencyType=minute&frequency=${freq}&needExtendedHoursData=false`;
+
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        const candles = data?.candles || [];
+        if (!candles.length) throw new Error("No intraday data available for this option");
+
+        const ohlc = candles.map(c => ({ time: Math.floor(c.datetime/1000), open:c.open, high:c.high, low:c.low, close:c.close }));
+        const vols = candles.map(c => ({ time: Math.floor(c.datetime/1000), value:c.volume, color: c.close>=c.open ? "#00e67666":"#ff444466" }));
+
+        const el  = chartRef.current;
+        const vel = volRef.current;
+        if (!el || !vel) return;
+
+        const LWC = window.LightweightCharts;
+        const mainChart = LWC.createChart(el, {
+          width: el.offsetWidth, height: 200,
+          layout: { background: { color:"transparent" }, textColor: T.muted },
+          grid: { vertLines:{color:T.border}, horzLines:{color:T.border} },
+          crosshair: { mode: LWC.CrosshairMode.Normal },
+          rightPriceScale: { borderColor: T.border2 },
+          timeScale: { borderColor: T.border2, timeVisible:true, secondsVisible:false },
+        });
+        const cs = mainChart.addCandlestickSeries({
+          upColor:T.green, downColor:T.red,
+          borderUpColor:T.green, borderDownColor:T.red,
+          wickUpColor:T.green, wickDownColor:T.red,
+        });
+        cs.setData(ohlc);
+        chartInst.current = mainChart;
+
+        const volChart = LWC.createChart(vel, {
+          width: vel.offsetWidth, height: 65,
+          layout: { background:{color:"transparent"}, textColor:T.muted },
+          grid: { vertLines:{color:"transparent"}, horzLines:{color:T.border} },
+          rightPriceScale: { borderColor:T.border2 },
+          timeScale: { borderColor:T.border2, timeVisible:false },
+        });
+        const vs = volChart.addHistogramSeries({ priceFormat:{type:"volume"}, priceScaleId:"" });
+        vs.priceScale().applyOptions({ scaleMargins:{top:0.1,bottom:0} });
+        vs.setData(vols);
+        volInst.current = volChart;
+
+        mainChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+          if (range) volChart.timeScale().setVisibleLogicalRange(range);
+        });
+
+        setLoading(false);
+      })
+      .catch(err => { setError(err.message); setLoading(false); });
+
+    return () => {
+      if (chartInst.current) { try { chartInst.current.remove(); } catch(e){} chartInst.current = null; }
+      if (volInst.current)   { try { volInst.current.remove();   } catch(e){} volInst.current   = null; }
+    };
+  }, [lwcReady, period, opt.strikePrice, type, ticker, expiry]);
+
+  const openFullPage = () => {
+    const p = new URLSearchParams({ ticker, expiry, strike: opt.strikePrice, type, period });
+    window.open(`/?chart=1&${p}`, "_blank");
+  };
+
+  return (
+    <tr>
+      <td colSpan={10} style={{padding:0,background:T.card,borderBottom:`2px solid ${T.border2}`}}>
+        <div className="fade-in" style={{padding:"16px 20px"}}>
+
+          {/* Panel header */}
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+            <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,color:T.text}}>
+              {ticker} ${opt.strikePrice} {type}
+            </span>
+            <span style={{fontSize:11,color:T.muted}}>{expiry}</span>
+            {itm && (
+              <span style={{fontSize:9,background:type==="Call"?T.green+"22":T.red+"22",color:type==="Call"?T.green:T.red,border:`1px solid ${type==="Call"?T.green+"55":T.red+"55"}`,borderRadius:4,padding:"2px 7px"}}>
+                ITM
+              </span>
+            )}
+            <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center"}}>
+              {["day","5day"].map(p => (
+                <button key={p} onClick={() => setPeriod(p)}
+                  style={{background:period===p?T.blue+"22":"transparent",color:period===p?T.blue:T.muted,border:`1px solid ${period===p?T.blue+"55":T.border}`,borderRadius:4,padding:"3px 10px",fontSize:10,fontFamily:T.font,cursor:"pointer"}}>
+                  {p==="day"?"1D":"5D"}
+                </button>
+              ))}
+              {!fullPage && <>
+                <button onClick={openFullPage}
+                  style={{background:"transparent",color:T.muted,border:`1px solid ${T.border}`,borderRadius:4,padding:"3px 10px",fontSize:10,fontFamily:T.font,cursor:"pointer"}}>
+                  ↗ Full Page
+                </button>
+                {onClose && <button onClick={onClose}
+                  style={{background:"transparent",color:T.muted,border:`1px solid ${T.border}`,borderRadius:4,padding:"3px 10px",fontSize:10,fontFamily:T.font,cursor:"pointer"}}>
+                  ✕
+                </button>}
+              </>}
+            </div>
+          </div>
+
+          {/* Quote strip */}
+          <div style={{display:"flex",gap:18,marginBottom:14,flexWrap:"wrap"}}>
+            {[["Bid",fmt(opt.bid)],["Ask",fmt(opt.ask)],["Mid",mid?fmt(mid):"—"],["Last",fmt(opt.last)],
+              ["IV",opt.volatility!=null?opt.volatility.toFixed(1)+"%":"—"],["Delta",fmt(opt.delta,3)],
+              ["OI",fmtK(opt.openInterest)],["Vol",fmtK(opt.totalVolume)]
+            ].map(([label,val]) => (
+              <div key={label} style={{display:"flex",flexDirection:"column",gap:2}}>
+                <span style={{fontSize:8,color:T.muted,letterSpacing:"0.08em"}}>{label}</span>
+                <span style={{fontSize:12,color:T.text}}>{val}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Chart area */}
+          <div style={{position:"relative",minHeight:error?0:280}}>
+            {loading && !error && (
+              <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",gap:8,background:T.card+"dd",zIndex:5,borderRadius:4}}>
+                <Spinner/><span style={{fontSize:11,color:T.muted}}>Loading price history…</span>
+              </div>
+            )}
+            {error ? (
+              <div style={{padding:"20px",textAlign:"center",color:T.muted,fontSize:11,background:T.surface,borderRadius:4}}>
+                ⚠ {error}
+              </div>
+            ) : (
+              <>
+                <div ref={chartRef} style={{width:"100%"}}/>
+                <div ref={volRef}   style={{width:"100%",marginTop:2}}/>
+              </>
+            )}
+          </div>
+
+          {/* Contract calculator */}
+          <div style={{marginTop:14,padding:"12px 16px",background:T.surface,border:`1px solid ${T.border}`,borderRadius:6}}>
+            <div style={{fontSize:9,color:T.muted,letterSpacing:"0.08em",marginBottom:10}}>CONTRACT CALCULATOR</div>
+            <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+              {/* Qty stepper */}
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <span style={{fontSize:11,color:T.muted}}>Qty</span>
+                <button onClick={() => setContracts(c => Math.max(1,c-1))}
+                  style={{width:22,height:22,background:T.border2,color:T.text,border:"none",borderRadius:3,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                <span style={{fontSize:14,color:T.text,minWidth:20,textAlign:"center"}}>{contracts}</span>
+                <button onClick={() => setContracts(c => c+1)}
+                  style={{width:22,height:22,background:T.border2,color:T.text,border:"none",borderRadius:3,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+              </div>
+              {/* Metrics */}
+              <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
+                {[
+                  ["Cost",      `$${cost.toLocaleString()}`,   T.text],
+                  ["Breakeven", `$${breakeven}`,                T.yellow],
+                  ["Max Profit", maxProfit,                     T.green],
+                  ["Premium",   `$${fmt(premium)} / contract`,  T.blue],
+                ].map(([label,val,color]) => (
+                  <div key={label} style={{display:"flex",flexDirection:"column",gap:2}}>
+                    <span style={{fontSize:8,color:T.muted,letterSpacing:"0.08em"}}>{label}</span>
+                    <span style={{fontSize:13,color,fontFamily:T.font}}>{val}</span>
+                  </div>
+                ))}
+              </div>
+              {/* Phase 2 — wired up when integrated into main app */}
+              <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+                <button disabled title="Coming soon — integrates with Options Tracker"
+                  style={{background:"transparent",color:T.dim,border:`1px solid ${T.border}`,borderRadius:4,padding:"5px 12px",fontSize:10,fontFamily:T.font,cursor:"not-allowed",opacity:0.45}}>
+                  + Add to Plan
+                </button>
+                <button disabled title="Coming soon — integrates with Options Tracker"
+                  style={{background:T.green+"0a",color:T.dim,border:`1px solid ${T.border}`,borderRadius:4,padding:"5px 12px",fontSize:10,fontFamily:T.font,cursor:"not-allowed",opacity:0.45}}>
+                  Trade →
+                </button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </td>
+    </tr>
+  );
 }
 
 // ── Option row ────────────────────────────────────────────────────────────────
-function OptionRow({ opt, type, stockPrice, onAdd }) {
+function OptionRow({ opt, type, stockPrice, activeChart, onChartToggle, maxOI }) {
   if (!opt) return (
     <tr className="strike-row" style={{borderBottom:`1px solid ${T.border}`}}>
-      {Array(9).fill(0).map((_,i) => <td key={i} style={{padding:"7px 10px",color:T.dim,fontSize:11,textAlign:"right"}}>—</td>)}
+      {Array(11).fill(0).map((_,i) => <td key={i} style={{padding:"7px 10px",color:T.dim,fontSize:11,textAlign:"right"}}>—</td>)}
     </tr>
   );
 
-  const itm    = type === "Call" ? stockPrice > opt.strikePrice : stockPrice < opt.strikePrice;
-  const mid    = opt.bid != null && opt.ask != null ? ((+opt.bid + +opt.ask)/2).toFixed(2) : null;
-  const ivPct  = opt.volatility != null ? (opt.volatility).toFixed(1)+"%" : "—";
+  const isActive = activeChart === opt.strikePrice;
+  const itm      = type === "Call" ? stockPrice > opt.strikePrice : stockPrice < opt.strikePrice;
+  const mid      = opt.bid != null && opt.ask != null ? ((+opt.bid + +opt.ask)/2).toFixed(2) : null;
+  const ivPct    = opt.volatility != null ? opt.volatility.toFixed(1)+"%" : "—";
+  const oiPct    = maxOI > 0 && opt.openInterest ? Math.round((opt.openInterest / maxOI) * 100) : 0;
+  const barColor = type === "Call" ? T.green : T.red;
 
   return (
     <tr className="strike-row" style={{
-      borderBottom: `1px solid ${T.border}`,
-      background: itm ? (type==="Call" ? "#00e67608" : "#ff444408") : "transparent",
+      borderBottom:`1px solid ${T.border}`,
+      background: isActive ? "#151e2a" : itm ? (type==="Call"?"#00e67608":"#ff444408") : "transparent",
     }}>
+      {/* Chart toggle */}
+      <td style={{padding:"6px 4px",textAlign:"center",width:26}}>
+        <button className={`chart-btn${isActive?" active":""}`}
+          onClick={() => onChartToggle(opt.strikePrice)}
+          title="View option chart">📈</button>
+      </td>
       {/* Strike */}
       <td style={{padding:"7px 10px",fontWeight:600,color:itm?(type==="Call"?T.green:T.red):T.text,fontSize:12,textAlign:"right",fontFamily:T.font}}>
         {opt.strikePrice}
-        {itm && <span style={{fontSize:8,color:itm?(type==="Call"?T.green:T.red):T.dim,marginLeft:4}}>ITM</span>}
+        {itm && <span style={{fontSize:8,marginLeft:4,color:type==="Call"?T.green:T.red}}>ITM</span>}
       </td>
       <td style={{padding:"7px 10px",color:T.text,fontSize:11,textAlign:"right"}}>{fmt(opt.bid)}</td>
       <td style={{padding:"7px 10px",color:T.text,fontSize:11,textAlign:"right"}}>{fmt(opt.ask)}</td>
       <td style={{padding:"7px 10px",color:mid?T.blue:T.muted,fontSize:11,textAlign:"right"}}>{mid||"—"}</td>
       <td style={{padding:"7px 10px",color:T.muted,fontSize:11,textAlign:"right"}} className="hide-mobile">{fmt(opt.last)}</td>
       <td style={{padding:"7px 10px",color:T.purple,fontSize:11,textAlign:"right"}} className="hide-mobile">{ivPct}</td>
-      <td style={{padding:"7px 10px",color:clr(opt.delta, type==="Call"?T.green:T.red, type==="Call"?T.red:T.green),fontSize:11,textAlign:"right"}} className="hide-mobile">{fmt(opt.delta,3)}</td>
+      <td style={{padding:"7px 10px",color:opt.delta!=null?(opt.delta>=0?T.green:T.red):T.muted,fontSize:11,textAlign:"right"}} className="hide-mobile">{fmt(opt.delta,3)}</td>
       <td style={{padding:"7px 10px",color:T.muted,fontSize:11,textAlign:"right"}} className="hide-mobile">{fmtK(opt.totalVolume)}</td>
       <td style={{padding:"7px 10px",color:T.dim,fontSize:11,textAlign:"right"}} className="hide-mobile">{fmtK(opt.openInterest)}</td>
+      {/* OI bar */}
+      <td style={{padding:"7px 8px 7px 6px",minWidth:80,width:120}}>
+        <div style={{display:"flex",alignItems:"center",gap:5}}>
+          <div style={{flex:1,height:6,background:T.border,borderRadius:3,overflow:"hidden"}}>
+            <div style={{width:`${oiPct}%`,height:"100%",background:barColor+"99",borderRadius:3,transition:"width 0.3s ease"}}/>
+          </div>
+          <span style={{fontSize:9,color:T.muted,minWidth:28,textAlign:"right"}}>{oiPct}%</span>
+        </div>
+      </td>
     </tr>
   );
 }
 
 // ── Chain table ───────────────────────────────────────────────────────────────
-function ChainTable({ calls, puts, stockPrice, showType }) {
-  // Collect all strikes
+function ChainTable({ calls, puts, stockPrice, showType, ticker, expiry, strikeCount, deepLink }) {
+  const [activeChart, setActiveChart] = useState(null);
+
+  // Auto-open chart panel for deep-linked strike once chain data arrives
+  useEffect(() => {
+    if (!deepLink || !calls.length && !puts.length) return;
+    setActiveChart(deepLink.strike);
+  }, [deepLink, calls.length, puts.length]); // eslint-disable-line
+
   const allStrikes = [...new Set([
     ...calls.map(o => o.strikePrice),
     ...puts.map(o => o.strikePrice),
@@ -99,32 +382,64 @@ function ChainTable({ calls, puts, stockPrice, showType }) {
   const callMap = Object.fromEntries(calls.map(o => [o.strikePrice, o]));
   const putMap  = Object.fromEntries(puts.map(o  => [o.strikePrice, o]));
 
+  // Filter to N strikes above and below current stock price
+  const filteredStrikes = (() => {
+    if (!stockPrice) return allStrikes;
+    const below = allStrikes.filter(s => s <= stockPrice).slice(-strikeCount);
+    const above = allStrikes.filter(s => s >  stockPrice).slice(0, strikeCount);
+    return [...below, ...above];
+  })();
+
+  // Max OI across filtered strikes for bar scaling
+  const maxOI = Math.max(1, ...filteredStrikes.map(s => {
+    const opt = showType === "Call" ? callMap[s] : putMap[s];
+    return opt?.openInterest || 0;
+  }));
+
   const thStyle = {padding:"6px 10px",textAlign:"right",color:T.muted,fontSize:9,fontFamily:T.font,letterSpacing:"0.08em",borderBottom:`1px solid ${T.border2}`,fontWeight:400};
 
-  const headers = ["STRIKE","BID","ASK","MID","LAST","IV","DELTA","VOL","OI"];
+  const handleToggle = (strike) => setActiveChart(prev => prev === strike ? null : strike);
 
   return (
     <div style={{overflowX:"auto"}}>
       <table className="chain-table" style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
         <thead>
           <tr style={{background:T.surface}}>
-            {headers.map((h,i) => (
-              <th key={h} style={{...thStyle, ...(i>4?{display:"none"}:{}), ...({})}}
-                className={i>=4?"hide-mobile":""}>
-                {h}
-              </th>
+            <th style={{...thStyle,width:26}}></th>
+            {["STRIKE","BID","ASK","MID","LAST","IV","DELTA","VOL","OI","OI BAR"].map((h,i) => (
+              <th key={h} style={{...thStyle,...(i===9?{textAlign:"left",paddingLeft:8}:{})}} className={i>=4&&i!==9?"hide-mobile":""}>{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {allStrikes.map(strike => (
-            <OptionRow
-              key={strike}
-              opt={showType==="Call" ? callMap[strike] : putMap[strike]}
-              type={showType}
-              stockPrice={stockPrice}
-            />
-          ))}
+          {filteredStrikes.map(strike => {
+            const opt = showType==="Call" ? callMap[strike] : putMap[strike];
+            return (
+              <>
+                <OptionRow
+                  key={`row-${strike}`}
+                  opt={opt}
+                  type={showType}
+                  stockPrice={stockPrice}
+                  activeChart={activeChart}
+                  onChartToggle={handleToggle}
+                  maxOI={maxOI}
+                />
+                {activeChart === strike && opt && (
+                  <ChartPanel
+                    key={`chart-${strike}`}
+                    opt={opt}
+                    type={showType}
+                    ticker={ticker}
+                    expiry={expiry}
+                    stockPrice={stockPrice}
+                    initialPeriod={deepLink?.strike === strike ? deepLink.period : "day"}
+                    onClose={() => setActiveChart(null)}
+                  />
+                )}
+              </>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -132,37 +447,28 @@ function ChainTable({ calls, puts, stockPrice, showType }) {
 }
 
 // ── Expiry row ────────────────────────────────────────────────────────────────
-function ExpiryRow({ expiry, dte, isOpen, onToggle, calls, puts, stockPrice, showType, onTypeChange }) {
+function ExpiryRow({ expiry, dte, isOpen, onToggle, calls, puts, stockPrice, showType, onTypeChange, ticker, strikeCount, deepLink }) {
   const totalVol = [...calls,...puts].reduce((s,o) => s+(o.totalVolume||0), 0);
   const totalOI  = [...calls,...puts].reduce((s,o) => s+(o.openInterest||0), 0);
-
   const dteColor = dte <= 7 ? T.red : dte <= 14 ? T.yellow : dte <= 30 ? T.blue : T.muted;
 
   return (
     <div style={{borderBottom:`1px solid ${T.border}`,overflow:"hidden"}}>
-      {/* Header row */}
-      <div className="expiry-row fade-in"
-        onClick={onToggle}
+      <div className="expiry-row fade-in" onClick={onToggle}
         style={{display:"flex",alignItems:"center",padding:"12px 16px",gap:12,background:isOpen?T.card:T.surface}}>
-        {/* Arrow */}
         <span style={{color:T.muted,fontSize:10,width:12,transition:"transform 0.15s",transform:isOpen?"rotate(90deg)":"none",display:"inline-block"}}>▶</span>
-        {/* Date */}
         <span style={{fontFamily:"'Syne',sans-serif",fontWeight:600,fontSize:14,color:T.text,flex:1}}>
           {new Date(expiry+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}
         </span>
-        {/* DTE badge */}
         <span style={{fontSize:9,fontFamily:T.font,color:dteColor,background:dteColor+"18",border:`1px solid ${dteColor}33`,borderRadius:4,padding:"2px 7px",flexShrink:0}}>
           {dte}d
         </span>
-        {/* Stats */}
         <span style={{fontSize:9,color:T.muted,fontFamily:T.font,flexShrink:0}} className="hide-mobile">
           Vol {fmtK(totalVol)} · OI {fmtK(totalOI)}
         </span>
       </div>
-      {/* Expanded chain */}
       {isOpen && (
         <div className="fade-in" style={{background:T.bg,borderTop:`1px solid ${T.border}`}}>
-          {/* Call/Put toggle */}
           <div style={{display:"flex",gap:0,padding:"8px 16px",borderBottom:`1px solid ${T.border}`}}>
             {["Call","Put"].map(t => (
               <button key={t} onClick={e=>{e.stopPropagation();onTypeChange(t);}}
@@ -175,9 +481,93 @@ function ExpiryRow({ expiry, dte, isOpen, onToggle, calls, puts, stockPrice, sho
               </button>
             ))}
           </div>
-          <ChainTable calls={calls} puts={puts} stockPrice={stockPrice} showType={showType}/>
+          <ChainTable
+            calls={calls} puts={puts}
+            stockPrice={stockPrice} showType={showType}
+            ticker={ticker} expiry={expiry}
+            strikeCount={strikeCount}
+            deepLink={deepLink?.expiry === expiry ? deepLink : null}
+          />
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Full page chart view ──────────────────────────────────────────────────────
+function FullPageChart({ ticker, expiry, strike, type, period }) {
+  const [opt,        setOpt]        = useState(null);
+  const [stockPrice, setStockPrice] = useState(null);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState(null);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        // Fetch quote
+        const qRes  = await fetch(`${PROXY}?path=/marketdata/v1/quotes&symbols=${ticker}&fields=quote&indicative=false`);
+        const qData = await qRes.json();
+        const q     = qData?.[ticker]?.quote ?? qData?.[ticker];
+        if (q?.lastPrice) setStockPrice(q.lastPrice);
+
+        // Fetch chain for this expiry to get the option data
+        const cRes  = await fetch(`${PROXY}?path=/marketdata/v1/chains&symbol=${ticker}&contractType=ALL&strikeCount=50&fromDate=${expiry}&toDate=${expiry}`);
+        const cData = await cRes.json();
+        const map   = type === "Call" ? cData?.callExpDateMap : cData?.putExpDateMap;
+        let found   = null;
+        for (const [, strikes] of Object.entries(map || {}))
+          for (const [, opts] of Object.entries(strikes))
+            for (const o of opts)
+              if (+o.strikePrice === +strike) found = o;
+        if (!found) throw new Error(`No data found for ${ticker} $${strike} ${type} ${expiry}`);
+        setOpt(found);
+      } catch (e) {
+        setError(e.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+    load();
+  }, []);
+
+  return (
+    <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:T.font}}>
+      <style>{css}</style>
+      {/* Minimal header */}
+      <div style={{background:T.surface,borderBottom:`1px solid ${T.border}`,padding:"10px 20px",display:"flex",alignItems:"center",gap:12}}>
+        <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:14,color:T.blue,letterSpacing:"0.04em"}}>
+          OPTIONS<span style={{color:T.green}}>.</span>CHAIN
+        </div>
+        <span style={{fontSize:11,color:T.muted}}>
+          {ticker} ${strike} {type} · {expiry}
+        </span>
+        <a href="/" style={{marginLeft:"auto",fontSize:10,color:T.muted,textDecoration:"none",border:`1px solid ${T.border}`,borderRadius:4,padding:"3px 10px"}}>
+          ← Back to Chain
+        </a>
+      </div>
+
+      <div style={{maxWidth:900,margin:"0 auto",padding:"20px"}}>
+        {loading && (
+          <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"60px 0"}}>
+            <Spinner/><span style={{fontSize:12,color:T.muted}}>Loading…</span>
+          </div>
+        )}
+        {error && (
+          <div style={{padding:"40px 20px",textAlign:"center",color:T.red,fontSize:12}}>⚠ {error}</div>
+        )}
+        {opt && !loading && (
+          <ChartPanel
+            opt={opt}
+            type={type}
+            ticker={ticker}
+            expiry={expiry}
+            stockPrice={stockPrice}
+            initialPeriod={period}
+            onClose={null}
+            fullPage={true}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -187,49 +577,36 @@ export default function OptionsChain() {
   const [ticker,      setTicker]      = useState("");
   const [inputVal,    setInputVal]    = useState("");
   const [loading,     setLoading]     = useState(false);
-  const [loadingExp,  setLoadingExp]  = useState(null); // expiry being loaded
+  const [loadingExp,  setLoadingExp]  = useState(null);
   const [error,       setError]       = useState(null);
   const [stockPrice,  setStockPrice]  = useState(null);
   const [stockChange, setStockChange] = useState(null);
-  const [expirations, setExpirations] = useState([]); // [{expiry, dte}]
-  const [chains,      setChains]      = useState({}); // {expiry: {calls,puts}}
+  const [expirations, setExpirations] = useState([]);
+  const [chains,      setChains]      = useState({});
   const [openExpiry,  setOpenExpiry]  = useState(null);
   const [showType,    setShowType]    = useState("Call");
+  const [strikeCount, setStrikeCount] = useState(5);
+  const [deepLink,    setDeepLink]    = useState(null); // { expiry, strike, type, period }
 
-  // ── Fetch quote + expirations ───────────────────────────────────────────────
   const fetchTicker = useCallback(async (sym) => {
     if (!sym) return;
-    setLoading(true);
-    setError(null);
-    setExpirations([]);
-    setChains({});
-    setOpenExpiry(null);
-    setStockPrice(null);
-
+    setLoading(true); setError(null); setExpirations([]); setChains({}); setOpenExpiry(null); setStockPrice(null);
+    ensureOITracking(sym);
     try {
-      // Quote
-      const qRes  = await fetch(`/api/schwab-proxy?path=/marketdata/v1/quotes&symbols=${sym}&fields=quote&indicative=false`);
+      const qRes  = await fetch(`${PROXY}?path=/marketdata/v1/quotes&symbols=${sym}&fields=quote&indicative=false`);
       const qData = await qRes.json();
       const q     = qData?.[sym]?.quote ?? qData?.[sym];
       if (q?.lastPrice) {
         setStockPrice(q.lastPrice);
         setStockChange({ change: q.netChange, pct: q.netPercentChange });
       }
-
-      // Expiration chain
-      const eRes  = await fetch(`/api/schwab-proxy?path=/marketdata/v1/expirationchain&symbol=${sym}`);
+      const eRes  = await fetch(`${PROXY}?path=/marketdata/v1/expirationchain&symbol=${sym}`);
       const eData = await eRes.json();
       const today = new Date(); today.setHours(0,0,0,0);
-
-      const exps = (eData?.expirationList || [])
-        .map(e => {
-          const d   = new Date(e.expirationDate+"T12:00:00");
-          const dte = Math.ceil((d - today) / 86400000);
-          return { expiry: e.expirationDate, dte, dteType: e.dteType };
-        })
+      const exps  = (eData?.expirationList || [])
+        .map(e => { const d = new Date(e.expirationDate+"T12:00:00"); return { expiry: e.expirationDate, dte: Math.ceil((d-today)/86400000) }; })
         .filter(e => e.dte >= 0)
         .sort((a,b) => a.dte - b.dte);
-
       setExpirations(exps);
     } catch (err) {
       setError(err.message);
@@ -238,25 +615,21 @@ export default function OptionsChain() {
     }
   }, []);
 
-  // ── Fetch chain for a specific expiry ───────────────────────────────────────
   const fetchChain = useCallback(async (sym, expiry) => {
-    if (chains[expiry]) return; // already loaded
+    if (chains[expiry]) return;
     setLoadingExp(expiry);
     try {
-      const res  = await fetch(`/api/schwab-proxy?path=/marketdata/v1/chains&symbol=${sym}&contractType=ALL&strikeCount=40&fromDate=${expiry}&toDate=${expiry}`);
+      const res  = await fetch(`${PROXY}?path=/marketdata/v1/chains&symbol=${sym}&contractType=ALL&strikeCount=40&fromDate=${expiry}&toDate=${expiry}`);
       const data = await res.json();
-
       const calls = [], puts = [];
-      for (const [, strikes] of Object.entries(data?.callExpDateMap || {}))
-        for (const [, opts] of Object.entries(strikes))
+      for (const [,strikes] of Object.entries(data?.callExpDateMap||{}))
+        for (const [,opts] of Object.entries(strikes))
           for (const o of opts) calls.push(o);
-      for (const [, strikes] of Object.entries(data?.putExpDateMap || {}))
-        for (const [, opts] of Object.entries(strikes))
+      for (const [,strikes] of Object.entries(data?.putExpDateMap||{}))
+        for (const [,opts] of Object.entries(strikes))
           for (const o of opts) puts.push(o);
-
-      calls.sort((a,b) => a.strikePrice - b.strikePrice);
-      puts.sort((a,b) => a.strikePrice - b.strikePrice);
-
+      calls.sort((a,b) => a.strikePrice-b.strikePrice);
+      puts.sort((a,b)  => a.strikePrice-b.strikePrice);
       setChains(prev => ({ ...prev, [expiry]: { calls, puts } }));
     } catch (err) {
       console.warn("Chain fetch failed:", err.message);
@@ -265,14 +638,36 @@ export default function OptionsChain() {
     }
   }, [chains]);
 
-  // ── Toggle expiry row ───────────────────────────────────────────────────────
+  // ── On mount: detect ?chart=1 params and auto-load ───────────────────────────
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    if (p.get("chart") !== "1") return;
+    const sym    = p.get("ticker")?.toUpperCase();
+    const expiry = p.get("expiry");
+    const strike = parseFloat(p.get("strike"));
+    const type   = p.get("type") || "Call";
+    const period = p.get("period") || "day";
+    if (!sym || !expiry || !strike) return;
+    setDeepLink({ expiry, strike, type, period });
+    setInputVal(sym);
+    setTicker(sym);
+    setShowType(type);
+    setStrikeCount(20);
+    fetchTicker(sym);
+  }, []); // eslint-disable-line
+
+  // ── Once expirations load, auto-open the deep-linked expiry ─────────────────
+  useEffect(() => {
+    if (!deepLink || !expirations.length || !ticker) return;
+    const match = expirations.find(e => e.expiry === deepLink.expiry);
+    if (!match) return;
+    setOpenExpiry(deepLink.expiry);
+    fetchChain(ticker, deepLink.expiry);
+  }, [deepLink, expirations, ticker]); // eslint-disable-line
+
   const toggleExpiry = (expiry) => {
-    if (openExpiry === expiry) {
-      setOpenExpiry(null);
-    } else {
-      setOpenExpiry(expiry);
-      fetchChain(ticker, expiry);
-    }
+    if (openExpiry === expiry) { setOpenExpiry(null); }
+    else { setOpenExpiry(expiry); fetchChain(ticker, expiry); }
   };
 
   const handleSearch = (e) => {
@@ -281,99 +676,102 @@ export default function OptionsChain() {
     if (sym) { setTicker(sym); fetchTicker(sym); }
   };
 
-  const changeDir = stockChange?.change >= 0;
+  const changeDir = (stockChange?.change ?? 0) >= 0;
+
+  // ── Full page chart mode ────────────────────────────────────────────────────
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get("chart") === "1") {
+    return (
+      <FullPageChart
+        ticker={urlParams.get("ticker")?.toUpperCase() || ""}
+        expiry={urlParams.get("expiry") || ""}
+        strike={parseFloat(urlParams.get("strike") || "0")}
+        type={urlParams.get("type") || "Call"}
+        period={urlParams.get("period") || "day"}
+      />
+    );
+  }
 
   return (
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:T.font}}>
       <style>{css}</style>
 
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      {/* Header */}
       <div style={{background:T.surface,borderBottom:`1px solid ${T.border}`,padding:"14px 20px",position:"sticky",top:0,zIndex:100}}>
-        <div style={{maxWidth:900,margin:"0 auto",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
-          {/* Title */}
+        <div style={{maxWidth:960,margin:"0 auto",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
           <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,color:T.blue,letterSpacing:"0.04em",flexShrink:0}}>
             OPTIONS<span style={{color:T.green}}>.</span>CHAIN
           </div>
-
-          {/* Search */}
           <form onSubmit={handleSearch} style={{display:"flex",gap:0,flex:1,minWidth:180,maxWidth:320}}>
-            <input
-              value={inputVal}
-              onChange={e => setInputVal(e.target.value.toUpperCase())}
+            <input value={inputVal} onChange={e => setInputVal(e.target.value.toUpperCase())}
               placeholder="Enter ticker… AAPL"
               style={{flex:1,background:T.card,border:`1px solid ${T.border2}`,borderRight:"none",borderRadius:"6px 0 0 6px",color:T.text,fontFamily:T.font,fontSize:13,padding:"8px 12px",outline:"none"}}
             />
             <button type="submit"
-              style={{background:T.blue+"22",border:`1px solid ${T.border2}`,borderRadius:"0 6px 6px 0",color:T.blue,fontFamily:T.font,fontSize:12,padding:"8px 14px",cursor:"pointer",fontWeight:600,whiteSpace:"nowrap"}}>
-              {loading ? <Spinner/> : "→"}
+              style={{background:T.blue+"22",border:`1px solid ${T.border2}`,borderRadius:"0 6px 6px 0",color:T.blue,fontFamily:T.font,fontSize:12,padding:"8px 14px",cursor:"pointer",fontWeight:600}}>
+              {loading ? <Spinner size={14}/> : "→"}
             </button>
           </form>
-
-          {/* Stock price */}
           {stockPrice && (
             <div style={{display:"flex",alignItems:"baseline",gap:8,flexShrink:0}}>
               <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:20,color:T.text}}>${(+stockPrice).toFixed(2)}</span>
-              <span style={{fontSize:11,color:changeDir?T.green:T.red,fontFamily:T.font}}>
+              <span style={{fontSize:11,color:changeDir?T.green:T.red}}>
                 {changeDir?"+":""}{fmt(stockChange?.change)} ({changeDir?"+":""}{fmt(stockChange?.pct,2)}%)
               </span>
+            </div>
+          )}
+          {/* Strike count filter */}
+          {stockPrice && (
+            <div style={{display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+              <span style={{fontSize:9,color:T.muted,letterSpacing:"0.06em",marginRight:4}}>STRIKES</span>
+              {[3,5,10,20].map(n => (
+                <button key={n} onClick={() => setStrikeCount(n)}
+                  style={{background:strikeCount===n?T.blue+"22":"transparent",color:strikeCount===n?T.blue:T.muted,border:`1px solid ${strikeCount===n?T.blue+"55":T.border}`,borderRadius:4,padding:"3px 8px",fontSize:10,fontFamily:T.font,cursor:"pointer",fontWeight:strikeCount===n?600:400}}>
+                  ±{n}
+                </button>
+              ))}
             </div>
           )}
         </div>
       </div>
 
-      {/* ── Content ────────────────────────────────────────────────────────── */}
-      <div style={{maxWidth:900,margin:"0 auto"}}>
-        {error && (
-          <div style={{padding:"16px 20px",color:T.red,fontSize:12,borderBottom:`1px solid ${T.border}`}}>
-            ⚠ {error}
-          </div>
-        )}
-
+      {/* Content */}
+      <div style={{maxWidth:960,margin:"0 auto"}}>
+        {error && <div style={{padding:"16px 20px",color:T.red,fontSize:12,borderBottom:`1px solid ${T.border}`}}>⚠ {error}</div>}
         {!ticker && !loading && (
           <div style={{padding:"80px 20px",textAlign:"center"}}>
             <div style={{fontFamily:"'Syne',sans-serif",fontSize:32,fontWeight:800,color:T.border2,marginBottom:12}}>Enter a ticker</div>
-            <div style={{fontSize:12,color:T.dim}}>Type a stock symbol above to view its options chain</div>
+            <div style={{fontSize:12,color:T.dim}}>Type a symbol above · click 📈 on any strike to view its chart</div>
           </div>
         )}
-
-        {ticker && !loading && expirations.length === 0 && !error && (
-          <div style={{padding:"40px 20px",textAlign:"center",color:T.muted,fontSize:12}}>
-            No expirations found for {ticker}
-          </div>
+        {ticker && !loading && expirations.length===0 && !error && (
+          <div style={{padding:"40px 20px",textAlign:"center",color:T.muted,fontSize:12}}>No expirations found for {ticker}</div>
         )}
-
-        {/* Expiry list */}
         {expirations.length > 0 && (
           <div>
-            {/* Ticker header */}
             <div style={{padding:"12px 16px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",gap:10}}>
               <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22,color:T.text}}>{ticker}</span>
-              <span style={{fontSize:10,color:T.muted,fontFamily:T.font}}>{expirations.length} expirations</span>
-              <span style={{fontSize:10,color:T.muted,fontFamily:T.font,marginLeft:"auto"}}>Calls &amp; Puts</span>
+              <span style={{fontSize:10,color:T.muted}}>{expirations.length} expirations</span>
+              <span style={{fontSize:10,color:T.muted,marginLeft:"auto"}}>Click 📈 on any strike to view chart + calculator</span>
             </div>
-
             {expirations.map(({ expiry, dte }) => {
-              const chain      = chains[expiry] || { calls: [], puts: [] };
-              const isLoading  = loadingExp === expiry;
-              const isOpen     = openExpiry === expiry;
-
+              const chain     = chains[expiry] || { calls:[], puts:[] };
+              const isLoading = loadingExp === expiry;
+              const isOpen    = openExpiry === expiry;
               return (
                 <div key={expiry}>
                   <ExpiryRow
-                    expiry={expiry}
-                    dte={dte}
-                    isOpen={isOpen}
+                    expiry={expiry} dte={dte} isOpen={isOpen}
                     onToggle={() => toggleExpiry(expiry)}
-                    calls={chain.calls}
-                    puts={chain.puts}
-                    stockPrice={stockPrice}
-                    showType={showType}
-                    onTypeChange={setShowType}
+                    calls={chain.calls} puts={chain.puts}
+                    stockPrice={stockPrice} showType={showType}
+                    onTypeChange={setShowType} ticker={ticker}
+                    strikeCount={strikeCount}
+                    deepLink={deepLink}
                   />
                   {isLoading && (
                     <div style={{padding:"16px",display:"flex",alignItems:"center",justifyContent:"center",gap:8,background:T.bg,borderBottom:`1px solid ${T.border}`}}>
-                      <Spinner/>
-                      <span style={{fontSize:11,color:T.muted}}>Loading {expiry}…</span>
+                      <Spinner/><span style={{fontSize:11,color:T.muted}}>Loading {expiry}…</span>
                     </div>
                   )}
                 </div>
